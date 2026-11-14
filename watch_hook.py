@@ -8,6 +8,7 @@ case the app falls back to its normal permission dialog).
 """
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -126,6 +127,21 @@ def last_assistant_entry(transcript_path):
     return "", 0.0
 
 
+def background_tasks(transcript_path):
+    """How many background jobs (renders, watchers, monitors) the session started and has not
+    been told have finished. Their completion arrives later as a <task-notification>."""
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 3_000_000))
+            text = fh.read().decode("utf-8", "ignore")
+    except Exception:
+        return 0
+    started = set(re.findall(r"(?:running in background|[Mm]onitor started)[^\\\"]{0,40}?ID: ([A-Za-z0-9_-]+)", text))
+    done = set(re.findall(r"<task-id>([A-Za-z0-9_-]+)</task-id>", text))
+    return len(started - done)
+
+
 def load(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -178,6 +194,7 @@ def main():
         s["status"] = "idle"
     elif name == "UserPromptSubmit":
         s["status"] = "running"
+        s["background"] = 0
         prompt = " ".join(str(event.get("prompt", "")).split())
         # Harness-injected turns (<task-notification>, <agent-message>, ...) are not user tasks.
         if prompt and not prompt.startswith("<"):
@@ -210,6 +227,11 @@ def main():
             text = last_assistant_text(event.get("transcript_path"))
         if text:  # Codex hands it over directly; Claude Code needs the transcript
             s["summary"] = clean_text(text)
+        # Not really finished if it is waiting on background work that will wake it up again.
+        waiting = background_tasks(event.get("transcript_path")) if source == "claude" else 0
+        s["background"] = waiting
+        if waiting:
+            s["status"] = "running"
     elif name == "PermissionRequest":
         s["status"] = "waiting"
         req_id = uuid.uuid4().hex

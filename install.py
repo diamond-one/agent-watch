@@ -8,6 +8,8 @@
                                        also route Cursor shell commands through the widget
                                        (every command waits for you; see README)
     python install.py --remove         uninstall (combine with --claude / --codex / --cursor)
+    python install.py --startup        start the widget when you sign in to Windows
+    python install.py --no-startup     stop doing that
 
 Codex requires you to review and trust new hooks once: open /hooks in the CLI,
 or "Review hooks" / Settings > Hooks in the desktop app.
@@ -88,6 +90,12 @@ def configure(name, remove, approvals):
 
 def main():
     args = set(sys.argv[1:])
+    if args & {"--startup", "--no-startup"}:
+        import startup
+        (startup.enable if "--startup" in args else startup.disable)()
+        print("start with Windows:", "on" if startup.is_enabled() else "off")
+        if args <= {"--startup", "--no-startup"}:
+            return  # only the startup switch was asked for
     approvals = "--cursor-approvals" in args
     names = [n for n in TARGETS if f"--{n}" in args] or (["cursor"] if approvals else list(TARGETS))
     for name in names:

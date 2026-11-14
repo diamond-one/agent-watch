@@ -18,6 +18,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import startup  # noqa: E402
 from watch_hook import clean_text, last_assistant_entry  # noqa: E402
 
 try:
@@ -641,6 +642,10 @@ class AgentWatch:
         self.root.bind("<ButtonRelease-1>", self._drag_end, add="+")
         self.root.update_idletasks()
         self._round_corners()
+        try:
+            startup.refresh()  # keep the boot entry pointing at this copy if the folder moved
+        except Exception:
+            pass
         self.hotkey.start(self.cfg.get("hotkey"))
         self._poll_hotkey()
         self.tick()
@@ -1100,6 +1105,11 @@ class AgentWatch:
         # -- window ----------------------------------------------------------
         section("WINDOW")
         switch_row("Keep on top of other windows", "pinned")
+
+        boot = startup.is_enabled()  # the registry is the source of truth, not the config file
+        self.switch(row("Start with Windows"), boot,
+                    lambda: (startup.disable() if boot else startup.enable(), setattr(self, "sig", None))
+                    ).pack(side="right")
 
         r = row("Show or hide the panel")
         hk = self.cfg.get("hotkey")
