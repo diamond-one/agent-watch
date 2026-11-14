@@ -1,9 +1,10 @@
-"""Claude Code hook: records each session's state for the Agent Watch widget.
+"""Hook script: records each agent session's state for the Agent Watch widget.
 
-Registered for SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
-Notification, Stop, SessionEnd and PermissionRequest (see install.py).
-For PermissionRequest it blocks until the widget answers (or times out, in
-which case Claude Code falls back to its normal permission dialog).
+Usage (registered by install.py):  python watch_hook.py <claude|codex>
+
+Works for Claude Code and OpenAI Codex hooks (same event names and stdin fields).
+For PermissionRequest it blocks until the widget answers (or times out, in which
+case the app falls back to its normal permission dialog).
 """
 import json
 import os
@@ -20,6 +21,8 @@ WAIT_SECONDS = 100  # hook timeout in settings is 110
 
 def summarize_tool(name, tool_input):
     tool_input = tool_input or {}
+    if not isinstance(tool_input, dict):
+        tool_input = {"command": tool_input}
     detail = (
         tool_input.get("command")
         or tool_input.get("file_path")
@@ -46,6 +49,7 @@ def save(path, data):
 
 
 def main():
+    source = sys.argv[1] if len(sys.argv) > 1 else "claude"
     try:
         event = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     except Exception:
@@ -53,22 +57,24 @@ def main():
     SESSIONS.mkdir(parents=True, exist_ok=True)
     REQUESTS.mkdir(parents=True, exist_ok=True)
 
-    sid = event.get("session_id")
-    if not sid:
+    raw_id = event.get("session_id")
+    if not raw_id:
         return
+    key = f"{source}-{raw_id}"
     name = event.get("hook_event_name", "")
-    path = SESSIONS / f"{sid}.json"
+    path = SESSIONS / f"{key}.json"
 
     if name == "SessionEnd":
         path.unlink(missing_ok=True)
         return
 
     s = load(path)
-    s.setdefault("id", sid)
+    s["id"] = key
+    s["source"] = source
     s.setdefault("steps", [])
     s["cwd"] = event.get("cwd") or s.get("cwd", "")
     s["project"] = Path(s["cwd"]).name or s["cwd"] or "session"
-    s["transcript"] = event.get("transcript_path", s.get("transcript", ""))
+    s["transcript"] = event.get("transcript_path") or s.get("transcript", "")
     s["updated"] = time.time()
 
     if name == "SessionStart":
@@ -86,6 +92,8 @@ def main():
     elif name == "Notification":
         s["status"] = "waiting"
         s["note"] = str(event.get("message", ""))[:160]
+    elif name == "Interrupt":
+        s["status"] = "idle"
     elif name == "Stop":
         s["status"] = "done"
         s["finished"] = time.time()
@@ -108,7 +116,7 @@ def main():
         elif answer == "deny":
             decision = {"behavior": "deny", "message": "Denied from Agent Watch"}
         else:
-            return  # no answer: fall through to Claude Code's own dialog
+            return  # no answer: fall through to the app's own dialog
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PermissionRequest", "decision": decision}}))
         return
