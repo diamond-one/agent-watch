@@ -35,6 +35,97 @@ def summarize_tool(name, tool_input):
     return f"{name}: {detail}"[:140]
 
 
+CURSOR_EVENTS = {
+    "sessionStart": "SessionStart",
+    "beforeSubmitPrompt": "UserPromptSubmit",
+    "postToolUse": "PostToolUse",
+    "stop": "Stop",
+    "afterAgentResponse": "AgentResponse",
+    "sessionEnd": "SessionEnd",
+    "beforeShellExecution": "PermissionRequest",  # only registered with --cursor-approvals
+}
+
+
+def normalize_cursor(e):
+    """Map a Cursor hook payload onto the Claude Code / Codex shape used below."""
+    name = CURSOR_EVENTS.get(e.get("hook_event_name"))
+    if not name:
+        return None
+    roots = e.get("workspace_roots") or []
+    has_cmd = "command" in e and "tool_input" not in e
+    out = {
+        "hook_event_name": name,
+        "session_id": e.get("conversation_id") or e.get("session_id"),
+        "cwd": roots[0] if roots else e.get("cwd", ""),
+        "transcript_path": e.get("transcript_path"),
+        "prompt": e.get("prompt", ""),
+        "text": e.get("text", ""),
+        "tool_name": e.get("tool_name") or ("Shell" if has_cmd else ""),
+        "tool_input": {"command": e["command"]} if has_cmd else e.get("tool_input") or {},
+    }
+    if name == "Stop" and e.get("status") not in (None, "completed"):
+        out["hook_event_name"] = "Interrupt"  # aborted / error: not a clean finish
+    return out
+
+
+def clean_text(text, limit=320):
+    """Flatten an assistant message into a short plain-text blurb."""
+    text = str(text or "")
+    for mark in ("**", "__", "`", "```"):
+        text = text.replace(mark, "")
+    lines = [ln.strip().lstrip("#>-* ").strip() for ln in text.splitlines()]
+    text = " ".join(ln for ln in lines if ln)
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def last_assistant_text(transcript_path):
+    """Final assistant message from a Claude Code transcript (JSONL), or ''."""
+    return last_assistant_entry(transcript_path)[0]
+
+
+def _epoch(stamp):
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def last_assistant_entry(transcript_path):
+    """(text, epoch seconds) of the latest assistant message or wrap_up recap, or ('', 0)."""
+    try:
+        with open(transcript_path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 400_000))
+            lines = fh.read().decode("utf-8", "ignore").splitlines()
+    except Exception:
+        return "", 0.0
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        msg = entry.get("message") if isinstance(entry, dict) else None
+        if entry.get("type") != "assistant" or not isinstance(msg, dict):
+            continue
+        when = _epoch(entry.get("timestamp"))
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content, when
+        # Walk the blocks backwards so the latest wins. Besides plain text, the Claude desktop
+        # app ends a turn with a wrap_up tool call whose recap is the real summary.
+        for block in reversed(content or []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text" and block.get("text", "").strip():
+                return block["text"], when
+            if block.get("type") == "tool_use" and str(block.get("name", "")).endswith("wrap_up"):
+                recap = (block.get("input") or {}).get("recap")
+                if recap:
+                    return recap, when
+    return "", 0.0
+
+
 def load(path):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -54,6 +145,12 @@ def main():
         event = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     except Exception:
         return
+    if source == "cursor":
+        if event.get("hook_event_name") == "beforeSubmitPrompt":
+            print(json.dumps({"continue": True}))  # this hook must always answer
+        event = normalize_cursor(event)
+        if event is None:
+            return
     SESSIONS.mkdir(parents=True, exist_ok=True)
     REQUESTS.mkdir(parents=True, exist_ok=True)
 
@@ -81,22 +178,38 @@ def main():
         s["status"] = "idle"
     elif name == "UserPromptSubmit":
         s["status"] = "running"
-        s["task"] = " ".join(str(event.get("prompt", "")).split())[:120]
-        s["steps"] = []
+        prompt = " ".join(str(event.get("prompt", "")).split())
+        # Harness-injected turns (<task-notification>, <agent-message>, ...) are not user tasks.
+        if prompt and not prompt.startswith("<"):
+            s["task"] = prompt[:120]
+            s["steps"] = []
+            s["turn_started"] = time.time()  # lets the widget ignore narration from older turns
+            s.pop("summary", None)
     elif name == "PreToolUse":
         s["status"] = "running"
         s["steps"].append(summarize_tool(event.get("tool_name", ""), event.get("tool_input")))
         s["steps"] = s["steps"][-30:]
     elif name == "PostToolUse":
         s["status"] = "running"
+        if source == "cursor":  # Cursor has no pre-tool hook here, so log the step afterwards
+            s["steps"].append(summarize_tool(event.get("tool_name", ""), event.get("tool_input")))
+            s["steps"] = s["steps"][-30:]
     elif name == "Notification":
         s["status"] = "waiting"
         s["note"] = str(event.get("message", ""))[:160]
     elif name == "Interrupt":
         s["status"] = "idle"
+    elif name == "AgentResponse":  # Cursor: the reply text arrives just before stop
+        s["summary"] = clean_text(event.get("text"))
     elif name == "Stop":
         s["status"] = "done"
         s["finished"] = time.time()
+        text = event.get("last_assistant_message")
+        if not text:
+            time.sleep(0.5)  # the transcript can lag a moment behind the Stop event
+            text = last_assistant_text(event.get("transcript_path"))
+        if text:  # Codex hands it over directly; Claude Code needs the transcript
+            s["summary"] = clean_text(text)
     elif name == "PermissionRequest":
         s["status"] = "waiting"
         req_id = uuid.uuid4().hex
@@ -111,6 +224,15 @@ def main():
         s["status"] = "running" if answer else "waiting"
         s["updated"] = time.time()
         save(path, s)
+        if source == "cursor":
+            if answer == "allow":
+                out = {"permission": "allow"}
+            elif answer == "deny":
+                out = {"permission": "deny", "user_message": "Denied from Agent Watch"}
+            else:
+                out = {"permission": "ask"}  # no answer: let Cursor decide
+            print(json.dumps(out))
+            return
         if answer == "allow":
             decision = {"behavior": "allow"}
         elif answer == "deny":
