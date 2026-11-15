@@ -26,6 +26,8 @@ pythonw agent_watch.py # launch the widget (python agent_watch.py to see errors)
 
 Use `--claude`, `--codex` or `--cursor` to install for one only, and `--remove` to uninstall. Restart open sessions so they pick up the hooks.
 
+**As an app:** `python install.py --app` adds "Agent Watch" to the Start menu (with its icon) and starts it with Windows. Only one copy ever runs, so launching it again does nothing. `--remove-app` undoes both.
+
 **Start with Windows:** turn it on in settings (⚙ > Start with Windows) or run `python install.py --startup` (`--no-startup` to undo). It adds one per-user entry under `HKCU\...\Run`, so no admin rights are needed, and it repoints itself if you move the folder.
 
 **Codex:** hooks go to `~/.codex/hooks.json`. Codex asks you to review and trust new hooks once: run `/hooks` in the CLI, or use "Review hooks" / Settings > Hooks in the desktop app. Whether the desktop app reads `~/.codex/hooks.json` is not documented, so check that the hooks show up there.

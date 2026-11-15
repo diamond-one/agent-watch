@@ -1335,5 +1335,15 @@ class AgentWatch:
         self.root.mainloop()
 
 
+def single_instance():
+    """Only one widget at a time (Start menu + autostart + manual launches must not stack)."""
+    if os.environ.get("AGENT_WATCH_DIR"):  # scratch/test runs
+        return True
+    global _MUTEX
+    _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\AgentWatchWidget")
+    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+
 if __name__ == "__main__":
-    AgentWatch().run()
+    if single_instance():
+        AgentWatch().run()

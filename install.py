@@ -10,6 +10,8 @@
     python install.py --remove         uninstall (combine with --claude / --codex / --cursor)
     python install.py --startup        start the widget when you sign in to Windows
     python install.py --no-startup     stop doing that
+    python install.py --app            Start menu entry "Agent Watch" + start with Windows
+    python install.py --remove-app     remove both
 
 Codex requires you to review and trust new hooks once: open /hooks in the CLI,
 or "Review hooks" / Settings > Hooks in the desktop app.
@@ -90,11 +92,23 @@ def configure(name, remove, approvals):
 
 def main():
     args = set(sys.argv[1:])
+    if args & {"--app", "--remove-app"}:
+        import startup
+        if "--app" in args:
+            startup.add_shortcut()
+            startup.enable()
+        else:
+            startup.remove_shortcut()
+            startup.disable()
+        print("Start menu entry:", "yes" if startup.has_shortcut() else "no",
+              "| start with Windows:", "on" if startup.is_enabled() else "off")
+        if args <= {"--app", "--remove-app"}:
+            return
     if args & {"--startup", "--no-startup"}:
         import startup
         (startup.enable if "--startup" in args else startup.disable)()
         print("start with Windows:", "on" if startup.is_enabled() else "off")
-        if args <= {"--startup", "--no-startup"}:
+        if args <= {"--startup", "--no-startup", "--app", "--remove-app"}:
             return  # only the startup switch was asked for
     approvals = "--cursor-approvals" in args
     names = [n for n in TARGETS if f"--{n}" in args] or (["cursor"] if approvals else list(TARGETS))
