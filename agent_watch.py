@@ -10,15 +10,18 @@ import json
 import math
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import startup  # noqa: E402
+import updates  # noqa: E402
 from watch_hook import clean_text, last_assistant_entry  # noqa: E402
 
 try:
@@ -50,6 +53,7 @@ DEFAULTS = {
     "auto_expand": True,
     "peek_finish": True,  # briefly expand when an agent finishes
     "peek_seconds": 3.0,
+    "check_updates": True,  # look on GitHub for a newer version (twice a day)
     "hotkey": {"ctrl": True, "alt": False, "shift": False, "vk": 0xC0},  # Ctrl+`
     "jump_on_finish": False,  # force focus: switch to the agent's chat when it finishes
     "collapsed": [],  # ids of agents folded to a single row
@@ -625,6 +629,7 @@ class AgentWatch:
         self.answered = set()  # (session, question) pairs already replied to from here
         self.capture_msg = ""
         self.hotkey = Hotkey()
+        self.update = {"latest": None, "state": "idle", "note": ""}  # idle|checking|failed|updating
         self.sig = None
         self.prev_status = None  # None until the first read, so startup is silent
         self.peek_job = None
@@ -648,6 +653,8 @@ class AgentWatch:
             pass
         self.hotkey.start(self.cfg.get("hotkey"))
         self._poll_hotkey()
+        self._poll_show()
+        self._load_update_cache()
         self.tick()
         self.pulse()
 
@@ -710,7 +717,7 @@ class AgentWatch:
         if not self.collapsed <= live:  # forget agents that are gone
             self.set_collapsed(self.collapsed & live)
         sig = json.dumps([self.expanded, self.show_settings, self.cfg, sorted(self.open_cards),
-                          self.capturing, self.capture_msg, self.hotkey.ok, sessions], sort_keys=True)
+                          self.capturing, self.capture_msg, self.hotkey.ok, self.update, sessions], sort_keys=True)
         if sig != self.sig:
             self.sig = sig
             self.render(sessions)
@@ -837,6 +844,8 @@ class AgentWatch:
                            image=aa_image(("ib", kind, size, surface, ink, bg), size, size, bg, layers))
             if kind == "cog":
                 c.create_text(mid, mid, text="⚙", fill=ink, font=("Segoe UI Symbol", 13))
+                if self.update_available():  # a dot: there's a newer version
+                    c.create_oval(size - 10, 3, size - 4, 9, fill=COLORS["running"], outline=bg)
 
         paint()
         c.bind("<Enter>", lambda e: paint(True))
@@ -914,6 +923,83 @@ class AgentWatch:
         if not self.expanded:
             self.show_settings = False
         self.sig = None
+
+    # --- second launch / updates ---------------------------------------------
+    def _poll_show(self):
+        """Launching Agent Watch again (Start menu, shortcut) brings the running one forward."""
+        try:
+            if _SHOW and ctypes.windll.kernel32.WaitForSingleObject(_SHOW, 0) == 0:
+                self.show_self()
+        except Exception:
+            pass
+        self.root.after(300, self._poll_show)
+
+    def show_self(self):
+        self.cancel_peek()
+        self.expanded = True
+        self.show_settings = False
+        self.sig = None
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
+        self.root.lift()
+        if not self.cfg["pinned"]:
+            self.root.after(400, lambda: self.root.attributes("-topmost", False))
+
+    UPDATE_CACHE = HOME / "update.json"
+    CHECK_EVERY = 12 * 3600
+
+    def _load_update_cache(self):
+        try:
+            cache = json.loads(self.UPDATE_CACHE.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+        self.update["latest"] = cache.get("latest")
+        if self.cfg["check_updates"] and time.time() - cache.get("checked", 0) > self.CHECK_EVERY:
+            self.check_update()
+        self.root.after(self.CHECK_EVERY * 1000, self._load_update_cache)
+
+    def check_update(self):
+        if self.update["state"] in ("checking", "updating"):
+            return
+        self.update.update(state="checking", note="")
+
+        def work():
+            latest = updates.fetch_latest()
+            if latest:
+                try:
+                    HOME.mkdir(parents=True, exist_ok=True)
+                    self.UPDATE_CACHE.write_text(json.dumps({"latest": latest, "checked": time.time()}),
+                                                 encoding="utf-8")
+                except OSError:
+                    pass
+                self.update.update(latest=latest, state="idle")
+            else:
+                self.update.update(state="failed")
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_available(self):
+        return self.cfg["check_updates"] and updates.newer(self.update["latest"], updates.local_version())
+
+    def apply_update(self):
+        """Git clones pull the new version and restart; other installs open the download page."""
+        if not updates.is_git_clone():
+            webbrowser.open(updates.PAGE)
+            return
+        self.update.update(state="updating", note="")
+
+        def work():
+            ok, msg = updates.pull()
+            log(f"update: pull {'ok' if ok else 'failed'}: {msg!r}")
+            if not ok:
+                self.update.update(state="failed", note="Couldn't update. Run git pull in the Agent Watch folder.")
+                return
+            self.restart()
+        threading.Thread(target=work, daemon=True).start()
+
+    def restart(self):
+        cmd = f'ping -n 3 127.0.0.1 >nul & "{startup.launcher()}" "{startup.SCRIPT}"'
+        subprocess.Popen(f'cmd /c "{cmd}"', creationflags=0x08000008, close_fds=True)
+        os._exit(0)
 
     # --- shortcut ---------------------------------------------------------
     def _poll_hotkey(self):
@@ -1169,6 +1255,31 @@ class AgentWatch:
                  else "Drag the panel to place it anywhere. It remembers where you leave it."
                  ).pack(side="left", padx=(12, 0), anchor="n")
 
+        # -- about -----------------------------------------------------------
+        section("ABOUT")
+        switch_row("Check for updates", "check_updates")
+        r = row(f"Agent Watch v{updates.local_version()}")
+        u = self.update
+        if u["state"] == "updating":
+            tk.Label(r, text="Updating…", fg=DIM, bg=CARD, font=(UI, 8)).pack(side="right")
+        elif u["state"] == "checking":
+            tk.Label(r, text="Checking…", fg=DIM, bg=CARD, font=(UI, 8)).pack(side="right")
+        elif self.update_available():
+            self.chip(r, f"Update to v{u['latest']}", self.apply_update, fg="#0d1a10",
+                      bg=COLORS["running"], hover="#d4ff7a", padx=10, pady=3,
+                      font=(UI, 8, "bold")).pack(side="right")
+        else:
+            self.chip(r, "Check now", self.check_update, bg=BG, padx=10, pady=3,
+                      font=(UI, 8, "bold")).pack(side="right")
+            msg = ("Couldn't reach GitHub" if u["state"] == "failed"
+                   else "Up to date" if u["latest"] else "")
+            if msg:
+                tk.Label(r, text=msg, fg=COLORS["waiting"] if u["state"] == "failed" else FAINT, bg=CARD,
+                         font=(UI, 8)).pack(side="right", padx=(0, 8))
+        if u.get("note"):
+            tk.Label(panel, text=u["note"], fg=COLORS["waiting"], bg=CARD, font=(UI, 8),
+                     wraplength=WIDTH - 60, justify="left", anchor="w").pack(anchor="w")
+
     # --- agent card -------------------------------------------------------
     def card(self, s):
         status = s.get("status", "idle")
@@ -1335,13 +1446,25 @@ class AgentWatch:
         self.root.mainloop()
 
 
+_SHOW = None  # event the running widget waits on; a second launch sets it
+
+
 def single_instance():
-    """Only one widget at a time (Start menu + autostart + manual launches must not stack)."""
+    """Only one widget at a time. A second launch (Start menu, shortcut) asks the first to show itself."""
+    global _MUTEX, _SHOW
     if os.environ.get("AGENT_WATCH_DIR"):  # scratch/test runs
         return True
-    global _MUTEX
-    _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\AgentWatchWidget")
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    k = ctypes.windll.kernel32
+    k.CreateMutexW.restype = wintypes.HANDLE
+    k.CreateEventW.restype = wintypes.HANDLE
+    k.SetEvent.argtypes = [wintypes.HANDLE]
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _MUTEX = k.CreateMutexW(None, False, "Local\\AgentWatchWidget")
+    first = k.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+    _SHOW = k.CreateEventW(None, False, False, "Local\\AgentWatchShow")
+    if not first:
+        k.SetEvent(_SHOW)
+    return first
 
 
 if __name__ == "__main__":
