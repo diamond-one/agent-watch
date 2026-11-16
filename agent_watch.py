@@ -500,7 +500,7 @@ def log(msg):
     try:
         HOME.mkdir(parents=True, exist_ok=True)
         with open(HOME / "agent-watch.log", "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+            fh.write(f"{time.strftime('%m-%d %H:%M:%S')} {msg}\n")
     except Exception:
         pass
 
@@ -617,6 +617,10 @@ class AgentWatch:
         self.cfg = load_config()
         self.root = tk.Tk()
         self.root.title("Agent Watch")
+        self.root.report_callback_exception = self._callback_error
+        self.root.protocol("WM_DELETE_WINDOW", self._close_requested)
+        self.last_tick = time.time()
+        log(f"start: pid {os.getpid()} v{updates.local_version()}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", self.cfg["pinned"])
         self.root.attributes("-alpha", self.cfg["opacity"])
@@ -709,8 +713,48 @@ class AgentWatch:
             self.set_cfg(anchor="free", ax=ax, ay=ay,
                          x=x + w if ax == "r" else x, y=y + h if ay == "b" else y)
 
+    # --- staying alive --------------------------------------------------
+    def _callback_error(self, exc, val, tb):
+        import traceback
+        log("error in a callback:\n" + "".join(traceback.format_exception(exc, val, tb)).rstrip())
+
+    def _close_requested(self):
+        """Alt+F4 or a close request from Windows. Ignored: use Quit in settings to close on purpose."""
+        log("close requested (Alt+F4 or the system); ignored")
+
+    def quit(self):
+        log("quit: closed from settings")
+        os._exit(0)
+
+    def keep_visible(self):
+        """After sleep/resume or a monitor change Windows can leave the window hidden, off-screen or
+        no longer on top. Put it back."""
+        woke = time.time() - self.last_tick > 20  # the clock jumped: the computer was asleep
+        self.last_tick = time.time()
+        if self.sig is None:  # nothing drawn or placed yet
+            return
+        try:
+            if woke:
+                log("woke from sleep; re-placing the window")
+            if woke or self.root.state() != "normal":
+                self.root.deiconify()
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)  # virtual screen origin
+            vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+            on_screen = x + w > vx + 20 and x < vx + vw - 20 and y + h > vy + 20 and y < vy + vh - 20
+            if woke or not on_screen:
+                if not on_screen:
+                    log(f"window was off-screen at {x},{y}; moving it back")
+                self.place()
+            if self.cfg["pinned"]:
+                self.root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
     # --- loop -----------------------------------------------------------
     def tick(self):
+        self.keep_visible()
         sessions = read_sessions()
         self.detect_changes(sessions)
         live = {s["id"] for s in sessions}
@@ -1276,6 +1320,8 @@ class AgentWatch:
             if msg:
                 tk.Label(r, text=msg, fg=COLORS["waiting"] if u["state"] == "failed" else FAINT, bg=CARD,
                          font=(UI, 8)).pack(side="right", padx=(0, 8))
+        self.chip(row("Close Agent Watch"), "Quit", self.quit, bg=BG, padx=10, pady=3,
+                  font=(UI, 8, "bold")).pack(side="right")
         if u.get("note"):
             tk.Label(panel, text=u["note"], fg=COLORS["waiting"], bg=CARD, font=(UI, 8),
                      wraplength=WIDTH - 60, justify="left", anchor="w").pack(anchor="w")
@@ -1467,6 +1513,24 @@ def single_instance():
     return first
 
 
+def main():
+    import atexit
+    import faulthandler
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        faulthandler.enable(open(HOME / "crash.log", "a", encoding="utf-8"))  # native crashes
+    except Exception:
+        pass
+    atexit.register(lambda: log("exit"))
+    try:
+        AgentWatch().run()
+        log("the window loop ended")
+    except BaseException as exc:
+        import traceback
+        log("crashed:\n" + traceback.format_exc().rstrip())
+        raise
+
+
 if __name__ == "__main__":
     if single_instance():
-        AgentWatch().run()
+        main()
